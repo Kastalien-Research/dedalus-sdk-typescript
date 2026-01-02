@@ -13,3 +13,4 @@ dist-bundle
 **/.claude/
 **/.agent/
 .mcp.json
+cc_mcp_config.json
