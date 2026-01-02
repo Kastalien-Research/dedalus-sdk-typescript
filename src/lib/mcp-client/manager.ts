@@ -333,7 +333,7 @@ export class MCPClientManager {
     const [serverName, ...toolNameParts] = name.split('.');
     const toolName = toolNameParts.join('.');
 
-    if (!serverName) {
+    if (!serverName || toolNameParts.length === 0) {
       throw new Error(`Invalid tool name: ${name}`);
     }
 
