@@ -374,21 +374,9 @@ export class MCPClientManager {
    * @returns Prompt result
    * @throws Error if server not found
    */
-  async getPrompt(name: string, args?: Record<string, string>): Promise<GetPromptResult> {
-    const [serverName, ...promptNameParts] = name.split('.');
-    const promptName = promptNameParts.join('.');
-
-    if (!serverName || promptNameParts.length === 0) {
+    if (!serverName || serverName.trim() === '') {
       throw new Error(`Invalid prompt name: ${name}`);
     }
-
-    const client = this.clients.get(serverName);
-    if (!client) {
-      throw new Error(`Unknown server: ${serverName}`);
-    }
-
-    return client.getPrompt(promptName, args);
-  }
 
   /**
    * Close all connections.
