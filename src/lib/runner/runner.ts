@@ -16,6 +16,17 @@ import type { CompletionCreateParamsBase, StreamChunk } from '../../resources/ch
 import type { DedalusModelChoice } from '../../resources/shared';
 import { loggerFor } from '../../internal/utils/log';
 import type { Stream } from '../../core/streaming';
+import type { DedalusMCPClient } from '../mcp-client/client';
+import {
+  aggregateMCPTools,
+  mcpToolsToDedalusFormat,
+  routeMCPToolCall,
+  isMCPTool,
+  gatherResourceContext,
+  formatResourceContext,
+  closeAllMCPClients,
+  type MCPToolInfo,
+} from './mcp-integration';
 
 export type RunParams = Omit<
   CompletionCreateParamsBase,
@@ -27,7 +38,12 @@ export type RunParams = Omit<
   model: DedalusModelChoice | DedalusModelChoice[] | undefined;
   tools?: Iterable<Tool>;
   maxSteps?: number;
+  /** @deprecated Use mcpClients for client-side MCP support */
   mcpServers?: Iterable<string>;
+  /** MCP clients for client-side tool execution */
+  mcpClients?: DedalusMCPClient[];
+  /** Resource URIs to include as context from MCP servers */
+  mcpResources?: string[];
   autoExecuteTools?: boolean;
   responseFormat?: { [key: string]: unknown };
   transport?: 'http';
@@ -106,6 +122,7 @@ type RunnerState = {
   autoExecuteTools: boolean;
   maxSteps: number;
   mcpServers: string[];
+  mcpToolMap: Map<string, MCPToolInfo>;
   logger: ReturnType<typeof createLogger>;
   toolHandler: ReturnType<typeof createToolHandler>;
   stream: boolean;
@@ -150,6 +167,8 @@ export class DedalusRunner {
       model,
       maxSteps = 10,
       mcpServers,
+      mcpClients,
+      mcpResources,
       stream = false,
       transport = 'http',
       autoExecuteTools = true,
@@ -172,22 +191,46 @@ export class DedalusRunner {
     const modelSpec = normalizeModelSpec(model);
     const requestKwargs = buildRequestKwargs(apiParams);
 
+    // Aggregate MCP tools if clients provided
+    const mcpToolMap = mcpClients?.length
+      ? await aggregateMCPTools(mcpClients)
+      : new Map<string, MCPToolInfo>();
+
+    if (mcpToolMap.size > 0) {
+      const mcpToolNames = Array.from(mcpToolMap.keys());
+      logger.toolSchema([...toolHandler.listNames(), ...mcpToolNames]);
+    }
+
     const state: RunnerState = {
       model: modelSpec,
       requestKwargs,
       autoExecuteTools,
       maxSteps: Math.max(1, maxSteps),
       mcpServers: Array.from(mcpServers ?? []),
+      mcpToolMap,
       logger,
       toolHandler,
       stream: Boolean(stream ?? false),
     };
 
-    const conversation = buildInitialMessages({
+    // Gather resource context if specified
+    let resourceContextPrefix = '';
+    if (mcpResources?.length && mcpClients?.length) {
+      const contexts = await gatherResourceContext(mcpClients, mcpResources);
+      resourceContextPrefix = formatResourceContext(contexts);
+    }
+
+    // Build initial messages with optional resource context
+    let conversation = buildInitialMessages({
       instructions,
       input,
       messages,
     });
+
+    // Prepend resource context if available
+    if (resourceContextPrefix) {
+      conversation = this.prependResourceContext(conversation, resourceContextPrefix);
+    }
 
     if (stream) {
       return this.runStreaming(conversation, state);
@@ -199,7 +242,12 @@ export class DedalusRunner {
   /** Executes synchronous multi-turn conversation with tool support. */
   private async runTurns(conversation: Message[], state: RunnerState): Promise<RunResult> {
     const history = [...conversation];
-    const toolSchemas = state.toolHandler.schemas() || null;
+    // Combine local tool schemas with MCP tool schemas
+    const localSchemas = state.toolHandler.schemas() || [];
+    const mcpSchemas = mcpToolsToDedalusFormat(state.mcpToolMap);
+    const toolSchemas = [...localSchemas, ...mcpSchemas].length > 0
+      ? [...localSchemas, ...mcpSchemas]
+      : null;
     let finalText = '';
     const toolResults: ToolResult[] = [];
     const toolsCalled: string[] = [];
@@ -321,6 +369,7 @@ export class DedalusRunner {
       await this.executeToolCallsSync({
         toolCalls: toolPayloads,
         toolHandler: state.toolHandler,
+        mcpToolMap: state.mcpToolMap,
         history,
         toolResults,
         toolsCalled,
@@ -336,7 +385,12 @@ export class DedalusRunner {
   /** Executes streaming conversation, yielding content deltas. */
   private async *runStreaming(conversation: Message[], state: RunnerState): AsyncIterableIterator<any> {
     const history = [...conversation];
-    const toolSchemas = state.toolHandler.schemas() || null;
+    // Combine local tool schemas with MCP tool schemas
+    const localSchemas = state.toolHandler.schemas() || [];
+    const mcpSchemas = mcpToolsToDedalusFormat(state.mcpToolMap);
+    const toolSchemas = [...localSchemas, ...mcpSchemas].length > 0
+      ? [...localSchemas, ...mcpSchemas]
+      : null;
     let previousModel: DedalusModelChoice | DedalusModelChoice[] | null = null;
     let steps = 0;
     const modelsUsed: DedalusModelChoice[] = [];
@@ -398,13 +452,16 @@ export class DedalusRunner {
       }
 
       const localToolNames = new Set(state.toolHandler.listNames());
-      const mcpNames = collectedToolCalls
-        .map((call) => call.function?.name)
-        .filter((name): name is string => name != null && !localToolNames.has(name));
       const hasStreamedContent = collectedContent.length > 0;
 
-      // MCP tools + streamed content means server already handled execution
-      if (mcpNames.length && hasStreamedContent) {
+      // Check for server-side MCP tools (from mcp_servers parameter) vs client-side MCP tools (from mcpClients)
+      const serverSideMcpNames = collectedToolCalls
+        .map((call) => call.function?.name)
+        .filter((name): name is string => 
+          name != null && !localToolNames.has(name) && !isMCPTool(name, state.mcpToolMap));
+
+      // Server-side MCP tools + streamed content means server already handled execution
+      if (serverSideMcpNames.length && hasStreamedContent) {
         const finalText = collectedContent.join('');
         if (finalText) {
           history.push({ role: 'assistant', content: finalText } as unknown as Message);
@@ -412,21 +469,23 @@ export class DedalusRunner {
         break;
       }
 
-      const allMcp = collectedToolCalls.every((call) => {
+      // Check if all tool calls are server-side MCP (not local, not client-side MCP)
+      const allServerSideMcp = collectedToolCalls.every((call) => {
         const name = call.function?.name;
-        return name != null && !localToolNames.has(name);
+        return name != null && !localToolNames.has(name) && !isMCPTool(name, state.mcpToolMap);
       });
 
-      if (allMcp) {
+      if (allServerSideMcp) {
         break;
       }
 
-      const localToolCalls = collectedToolCalls.filter((call) => {
+      // Filter to tools we need to execute (local + client-side MCP)
+      const executableToolCalls = collectedToolCalls.filter((call) => {
         const name = call.function?.name;
-        return name != null && localToolNames.has(name);
+        return name != null && (localToolNames.has(name) || isMCPTool(name, state.mcpToolMap));
       });
 
-      const toolPayloads = localToolCalls.map((call) => coerceToolCall(call));
+      const toolPayloads = executableToolCalls.map((call) => coerceToolCall(call));
       history.push({ role: 'assistant', tool_calls: toolPayloads } as unknown as Message);
 
       if (!state.autoExecuteTools) break;
@@ -449,7 +508,16 @@ export class DedalusRunner {
         }
 
         try {
-          const result = await state.toolHandler.exec(name, args);
+          let result: any;
+
+          // Check if this is an MCP tool
+          if (isMCPTool(name, state.mcpToolMap)) {
+            result = await routeMCPToolCall(name, args, state.mcpToolMap);
+          } else {
+            // Local tool
+            result = await state.toolHandler.exec(name, args);
+          }
+
           toolResults.push({ name, result, step: steps });
           if (!toolsCalled.includes(name)) toolsCalled.push(name);
 
@@ -471,10 +539,39 @@ export class DedalusRunner {
     }
   }
 
-  /** Executes local tools and appends results to conversation. */
+  /**
+   * Prepends resource context to conversation.
+   * Adds context to the system message or creates one if not present.
+   */
+  private prependResourceContext(conversation: Message[], resourceContext: string): Message[] {
+    if (!resourceContext) return conversation;
+
+    const result = [...conversation];
+    const firstMessage = result[0];
+
+    if (firstMessage && (firstMessage as any).role === 'system') {
+      // Prepend to existing system message
+      const systemMsg = firstMessage as any;
+      result[0] = {
+        ...systemMsg,
+        content: `${resourceContext}\n\n${systemMsg.content ?? ''}`,
+      } as Message;
+    } else {
+      // Insert new system message at the beginning
+      result.unshift({
+        role: 'system',
+        content: resourceContext,
+      } as unknown as Message);
+    }
+
+    return result;
+  }
+
+  /** Executes local and MCP tools and appends results to conversation. */
   private async executeToolCallsSync({
     toolCalls,
     toolHandler,
+    mcpToolMap,
     history,
     toolResults,
     toolsCalled,
@@ -483,6 +580,7 @@ export class DedalusRunner {
   }: {
     toolCalls: Array<any>;
     toolHandler: ReturnType<typeof createToolHandler>;
+    mcpToolMap: Map<string, MCPToolInfo>;
     history: Message[];
     toolResults: ToolResult[];
     toolsCalled: string[];
@@ -504,7 +602,16 @@ export class DedalusRunner {
       }
 
       try {
-        const result = await toolHandler.exec(name, args);
+        let result: any;
+
+        // Check if this is an MCP tool
+        if (isMCPTool(name, mcpToolMap)) {
+          result = await routeMCPToolCall(name, args, mcpToolMap);
+        } else {
+          // Local tool
+          result = await toolHandler.exec(name, args);
+        }
+
         toolResults.push({ name, result, step });
         if (!toolsCalled.includes(name)) toolsCalled.push(name);
 
