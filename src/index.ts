@@ -23,3 +23,13 @@ export {
 
 export { DedalusRunner } from './lib/runner';
 export { streamAsync, streamSync } from './lib/utils/stream';
+
+// MCP Client
+export { DedalusMCPClient } from './lib/mcp-client';
+export {
+  MCPError,
+  MCPConnectionError,
+  MCPTimeoutError,
+  MCPProtocolError,
+  MCPErrorCodes,
+} from './lib/mcp-client';
