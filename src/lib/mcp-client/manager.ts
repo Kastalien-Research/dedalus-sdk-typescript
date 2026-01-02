@@ -378,7 +378,7 @@ export class MCPClientManager {
     const [serverName, ...promptNameParts] = name.split('.');
     const promptName = promptNameParts.join('.');
 
-    if (!serverName) {
+    if (!serverName || promptNameParts.length === 0) {
       throw new Error(`Invalid prompt name: ${name}`);
     }
 
