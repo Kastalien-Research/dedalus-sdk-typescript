@@ -145,11 +145,10 @@ export function validateMCPConfig(config: unknown): config is MCPConfig {
     if (server['args'] !== undefined && !Array.isArray(server['args'])) {
       return false;
     }
-    if (server['env'] !== undefined && typeof server['env'] !== 'object') {
+    if (server['env'] !== undefined && (server['env'] === null || typeof server['env'] !== 'object' || Array.isArray(server['env']))) {
       return false;
     }
-    if (server['headers'] !== undefined && typeof server['headers'] !== 'object') {
-      return false;
+    if (server['headers'] !== undefined && (server['headers'] === null || typeof server['headers'] !== 'object' || Array.isArray(server['headers']))) {
     }
     if (server['cwd'] !== undefined && typeof server['cwd'] !== 'string') {
       return false;
